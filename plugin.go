@@ -16,6 +16,7 @@ import (
 	"github.com/avanha/pmaas-plugin-bluez/internal/translate"
 	spi "github.com/avanha/pmaas-spi"
 	"github.com/avanha/pmaas-spi/bluetooth"
+	"github.com/avanha/pmaas-spi/environment"
 	"github.com/avanha/pmaas-spi/events"
 	"github.com/muka/go-bluetooth/api"
 )
@@ -32,7 +33,7 @@ type plugin struct {
 	config    PluginConfig
 	container spi.IPMAASContainer
 	coalescer *bluetooth.Coalescer
-	source    *source
+	source    *bluetooth.SourceState
 
 	// startScan is how a session is started: BlueZ's, except in tests.
 	startScan startScanFunc
@@ -57,7 +58,7 @@ func NewPlugin(config PluginConfig) Plugin {
 	return &plugin{
 		config:    config,
 		coalescer: bluetooth.NewCoalescer(),
-		source:    newSource(config.Name),
+		source:    bluetooth.NewSourceState(config.Name, "bluez"),
 		startScan: func(adapterId string) (chan translate.Observation, func(), error) {
 			return scanner.New().StartScan(adapterId)
 		},
@@ -205,12 +206,12 @@ func (p *plugin) run(ctx context.Context, adapterId string, sourceId string) {
 func (p *plugin) session(ctx context.Context, adapterId string, sourceId string) error {
 	observationCh, stopScan, err := p.startScan(adapterId)
 	if err != nil {
-		p.source.scanning(false, time.Now())
+		p.sourceDown(time.Now())
 
 		return fmt.Errorf("unable to start scanning: %w", err)
 	}
 
-	p.source.scanning(true, time.Now())
+	p.sourceUp(time.Now())
 
 	consumed := make(chan struct{})
 
@@ -236,7 +237,7 @@ func (p *plugin) session(ctx context.Context, adapterId string, sourceId string)
 
 	stopScan()
 	<-consumed
-	p.source.sessionEnded()
+	p.source.SetScanning(bluetooth.ScanOff)
 
 	if endedEarly {
 		return errors.New("BlueZ ended the discovery session")
@@ -245,9 +246,21 @@ func (p *plugin) session(ctx context.Context, adapterId string, sourceId string)
 	return nil
 }
 
+// sourceUp notes that a discovery session is running.
+func (p *plugin) sourceUp(at time.Time) {
+	p.source.SetConnectivity(environment.ConnectivityOnline, at)
+	p.source.SetScanning(bluetooth.ScanActive)
+}
+
+// sourceDown notes that a discovery session could not be started.
+func (p *plugin) sourceDown(at time.Time) {
+	p.source.SetConnectivity(environment.ConnectivityOffline, at)
+	p.source.SetScanning(bluetooth.ScanOff)
+}
+
 // handle takes in one observation and forwards what is wanted of it.
 func (p *plugin) handle(translator *translate.Translator, o translate.Observation) {
-	p.source.heard(o.Time)
+	p.source.Heard(o.Time)
 
 	result := translator.Translate(o)
 	if result.Verdict != bluetooth.Forward {
@@ -255,13 +268,13 @@ func (p *plugin) handle(translator *translate.Translator, o translate.Observatio
 	}
 
 	if err := bluetooth.PublishAdvertisement(p.container, result.Event); err != nil {
-		p.source.dropped()
+		p.source.Dropped()
 		fmt.Printf("%T unable to broadcast an advertisement from %s: %v\n", p, result.Event.Address, err)
 
 		return
 	}
 
-	p.source.forwarded()
+	p.source.Forwarded()
 }
 
 // wait waits for the time, or until the context is done, and says whether the time passed.
