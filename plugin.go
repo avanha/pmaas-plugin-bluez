@@ -263,6 +263,20 @@ func (p *plugin) handle(translator *translate.Translator, o translate.Observatio
 	p.source.Heard(o.Time)
 
 	result := translator.Translate(o)
+
+	if result.Sighting != nil {
+		if err := bluetooth.PublishSighting(p.container, *result.Sighting); err != nil {
+			p.source.Dropped()
+			fmt.Printf("%T unable to broadcast a sighting of %s: %v\n", p, result.Sighting.Address, err)
+
+			return
+		}
+
+		p.source.Sighted()
+
+		return
+	}
+
 	if result.Verdict != bluetooth.Forward {
 		return
 	}

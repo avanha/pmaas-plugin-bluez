@@ -29,6 +29,7 @@ type fakeContainer struct {
 	predicate    events.EventPredicate
 	receiversOff []int
 	broadcasts   []bluetooth.AdvertisementEvent
+	sightings    []bluetooth.SightingEvent
 	broadcastErr error
 }
 
@@ -78,8 +79,11 @@ func (c *fakeContainer) BroadcastEvent(_ string, event any) error {
 		return c.broadcastErr
 	}
 
-	if a, ok := event.(bluetooth.AdvertisementEvent); ok {
-		c.broadcasts = append(c.broadcasts, a)
+	switch e := event.(type) {
+	case bluetooth.AdvertisementEvent:
+		c.broadcasts = append(c.broadcasts, e)
+	case bluetooth.SightingEvent:
+		c.sightings = append(c.sightings, e)
 	}
 
 	return nil
@@ -551,5 +555,91 @@ func TestSession_ASessionBlueZEndsItselfIsAnError(t *testing.T) {
 		if err := p.session(ctx2, "hci9", "bluez_1"); err != nil {
 			t.Errorf("a session that ran its time: %v", err)
 		}
+	})
+}
+
+func (c *fakeContainer) sightingsSoFar() []bluetooth.SightingEvent {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return append([]bluetooth.SightingEvent(nil), c.sightings...)
+}
+
+func TestScanning_ADeviceNobodyWantsIsToldOfInASightingWhenSightingsAreAskedFor(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		phone := func(rssi int) translate.Observation {
+			return translate.Observation{Kind: translate.Added, Time: time.Now(), Address: "44:DC:FA:B6:5B:00", AddressType: "random", Name: "Phone", RSSI: rssi}
+		}
+
+		s := &sessions{scripts: []sessionScript{{feed: func(emit func(translate.Observation)) {
+			emit(phone(-60)) // before anyone has asked
+			time.Sleep(5 * time.Second)
+			emit(phone(-61)) // asked for by now
+			time.Sleep(5 * time.Second)
+			emit(phone(-62)) // too soon after the last
+			emit(translate.Observation{Kind: translate.Added, Time: time.Now(), Address: "A4:C1:38:CC:E2:F0", AddressType: "public", Name: "GVH5075_E2F0",
+				UUIDs: []string{bluetooth.UUID16(0xec88)}, ManufacturerData: map[uint16][]byte{0xec88: {0, 3, 0x39, 1}}})
+		}}}}
+
+		p, c := newTestPlugin(t, s)
+		p.Start()
+		synctest.Wait()
+
+		// Sightings are asked for, as is the Govee.
+		time.Sleep(time.Second)
+
+		interest := bluetooth.InterestEvent{Owner: "bluetooth", Rules: []bluetooth.Rule{goveeRule()}, Sightings: time.Minute}
+		if err := c.receiver(&events.EventInfo{Event: interest}); err != nil {
+			t.Fatal(err)
+		}
+
+		time.Sleep(15 * time.Second)
+		synctest.Wait()
+
+		got := c.sightingsSoFar()
+		if len(got) != 1 || got[0].Address != "44:DC:FA:B6:5B:00" || got[0].LocalName != "Phone" || got[0].RSSI != -61 ||
+			got[0].Source != "bluez_1" || got[0].AddressType != bluetooth.AddressRandom {
+			t.Fatalf("sightings %+v", got)
+		}
+
+		// The Govee was forwarded as an advertisement, not as a sighting.
+		if adverts := c.adverts(); len(adverts) != 1 || adverts[0].Address != "A4:C1:38:CC:E2:F0" {
+			t.Errorf("advertisements %+v", adverts)
+		}
+
+		if data := p.source.GetSourceData(); data.Sighted != 1 || data.Forwarded != 1 || data.Heard != 4 {
+			t.Errorf("source %+v", data)
+		}
+
+		stop(p)
+	})
+}
+
+func TestScanning_ASightingThatCouldNotBeBroadcastIsCountedAsDropped(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s := &sessions{scripts: []sessionScript{{feed: func(emit func(translate.Observation)) {
+			time.Sleep(2 * time.Second)
+			emit(translate.Observation{Kind: translate.Added, Time: time.Now(), Address: "44:DC:FA:B6:5B:00", AddressType: "random", Name: "Phone"})
+		}}}}
+
+		p, c := newTestPlugin(t, s)
+		p.Start()
+
+		if err := c.receiver(&events.EventInfo{Event: bluetooth.InterestEvent{Owner: "bluetooth", Sightings: time.Minute}}); err != nil {
+			t.Fatal(err)
+		}
+
+		c.mu.Lock()
+		c.broadcastErr = errors.New("bus is down")
+		c.mu.Unlock()
+
+		time.Sleep(3 * time.Second)
+		synctest.Wait()
+
+		if data := p.source.GetSourceData(); data.Dropped != 1 || data.Sighted != 0 {
+			t.Errorf("source %+v", data)
+		}
+
+		stop(p)
 	})
 }

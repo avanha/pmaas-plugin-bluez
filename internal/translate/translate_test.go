@@ -1,6 +1,7 @@
 package translate
 
 import (
+	"reflect"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -328,5 +329,104 @@ func TestTranslate_TheDeviceKeepsItsOwnCopyOfWhatBlueZGaveAndWhatItGaveOut(t *te
 	signal := tr.Translate(Observation{Kind: RSSI, Time: epoch.Add(time.Minute), Address: goveeAddress, RSSI: -50})
 	if signal.Verdict != bluetooth.Forward {
 		t.Errorf("the device no longer matches the rule after the copies were changed: %v", signal.Verdict)
+	}
+}
+
+func sightingsWanted(t *testing.T, rules ...bluetooth.Rule) *bluetooth.Coalescer {
+	t.Helper()
+
+	c := bluetooth.NewCoalescer()
+	if err := c.SetInterest(bluetooth.InterestEvent{Owner: "bluetooth", Rules: rules, Sightings: time.Minute}); err != nil {
+		t.Fatal(err)
+	}
+
+	return c
+}
+
+func phone(at time.Duration, name string) Observation {
+	return Observation{Kind: Added, Time: epoch.Add(at), Address: "44:DC:FA:B6:5B:00", AddressType: "random", Name: name, RSSI: -70}
+}
+
+func TestTranslate_ADeviceNobodyWantsIsASightingWhenSightingsAreAskedFor(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		tr := New("src", sightingsWanted(t, goveeRule()))
+
+		r := tr.Translate(phone(0, ""))
+		if r.Verdict != bluetooth.NotWanted || r.Rule != nil || r.Sighting == nil {
+			t.Fatalf("%v %+v %+v", r.Verdict, r.Rule, r.Sighting)
+		}
+
+		s := r.Sighting
+		if s.Source != "src" || s.Address != "44:DC:FA:B6:5B:00" || s.AddressType != bluetooth.AddressRandom || s.RSSI != -70 || !s.Time.Equal(epoch) {
+			t.Errorf("sighting %+v", s)
+		}
+
+		// The name, when it comes, is told at once.
+		named := phone(time.Second, "Phone")
+		named.Kind = Name
+
+		if r := tr.Translate(named); r.Sighting == nil || r.Sighting.LocalName != "Phone" {
+			t.Errorf("a name learned: %+v", r.Sighting)
+		}
+
+		// And nothing again for a minute.
+		if r := tr.Translate(phone(2*time.Second, "Phone")); r.Sighting != nil {
+			t.Errorf("told again at once: %+v", r.Sighting)
+		}
+	})
+}
+
+func TestTranslate_ASignalChangeOfADeviceNobodyWantsIsASightingAtTheIntervalNotBefore(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		tr := New("src", sightingsWanted(t, goveeRule()))
+		tr.Translate(phone(0, "Phone"))
+
+		signal := func(rssi int) Result {
+			return tr.Translate(Observation{Kind: RSSI, Time: time.Now(), Address: "44:DC:FA:B6:5B:00", RSSI: rssi})
+		}
+
+		if r := signal(-80); r.Sighting != nil {
+			t.Fatalf("a sighting straight after the first: %+v", r.Sighting)
+		}
+
+		time.Sleep(time.Minute)
+
+		// The interest has to be said again, as it is every minute.
+		if err := tr.coalescer.SetInterest(bluetooth.InterestEvent{Owner: "bluetooth", Rules: []bluetooth.Rule{goveeRule()}, Sightings: time.Minute}); err != nil {
+			t.Fatal(err)
+		}
+
+		r := signal(-85)
+		if r.Sighting == nil || r.Sighting.RSSI != -85 || r.Verdict == bluetooth.Forward {
+			t.Errorf("%v %+v", r.Verdict, r.Sighting)
+		}
+	})
+}
+
+func TestTranslate_AWantedDeviceIsNotASightingAndNoSightingsAreMadeUnlessAskedFor(t *testing.T) {
+	tr := New("src", sightingsWanted(t, goveeRule()))
+
+	if r := tr.Translate(govee(0, 1)); r.Verdict != bluetooth.Forward || r.Sighting != nil {
+		t.Errorf("a wanted device: %v %+v", r.Verdict, r.Sighting)
+	}
+
+	// Advertisements asked for and not sightings.
+	quiet := New("src", wanting(t, goveeRule()))
+
+	if r := quiet.Translate(phone(0, "Phone")); r.Sighting != nil {
+		t.Errorf("a sighting nobody asked for: %+v", r.Sighting)
+	}
+}
+
+func TestTranslate_ASightingCarriesWhatTheDeviceHasSaidOverTime(t *testing.T) {
+	tr := New("src", sightingsWanted(t, goveeRule()))
+
+	o := phone(0, "Phone")
+	o.UUIDs = []string{bluetooth.UUID16(0x180f)}
+	o.ManufacturerData = map[uint16][]byte{0x004c: {1, 2}}
+
+	r := tr.Translate(o)
+	if r.Sighting == nil || len(r.Sighting.ServiceUUIDs) != 1 || !reflect.DeepEqual(r.Sighting.ManufacturerIDs, []uint16{0x004c}) {
+		t.Errorf("%+v", r.Sighting)
 	}
 }

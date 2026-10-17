@@ -73,13 +73,19 @@ type device struct {
 type Translator struct {
 	source    string
 	coalescer *bluetooth.Coalescer
+	sightings *bluetooth.SightingTracker
 	devices   map[string]*device
 }
 
 // New makes a Translator whose events say they are from the source (the entity ID of the source), and which applies what the
 // Coalescer has been told is wanted.
 func New(source string, coalescer *bluetooth.Coalescer) *Translator {
-	return &Translator{source: source, coalescer: coalescer, devices: make(map[string]*device)}
+	return &Translator{
+		source:    source,
+		coalescer: coalescer,
+		sightings: bluetooth.NewSightingTracker(coalescer.Interests()),
+		devices:   make(map[string]*device),
+	}
 }
 
 // Forget drops a device BlueZ has removed.
@@ -98,6 +104,10 @@ type Result struct {
 
 	// Rule is the rule that governed it, if any, for counting by.
 	Rule *bluetooth.Rule
+
+	// Sighting is a device that nobody wants the advertisements of, and somebody wants to hear is around, to be broadcast.
+	// It is never set for an advertisement that is forwarded.
+	Sighting *bluetooth.SightingEvent
 }
 
 // Translate takes in an observation and says what to do about it.
@@ -147,9 +157,23 @@ func (t *Translator) Translate(o Observation) Result {
 	event.ManufacturerData = fresh
 	event.ServiceData = service
 
-	verdict, rule := t.coalescer.AdmitAs(t.viewOf(o, d), &event)
+	view := t.viewOf(o, d)
+
+	verdict, rule := t.coalescer.AdmitAs(view, &event)
+	if verdict == bluetooth.NotWanted {
+		return Result{Event: event, Verdict: verdict, Sighting: t.sighting(view)}
+	}
 
 	return Result{Event: event, Verdict: verdict, Rule: rule}
+}
+
+// sighting is the sighting to broadcast of the device, if one is due.
+func (t *Translator) sighting(view *bluetooth.AdvertisementEvent) *bluetooth.SightingEvent {
+	if sighting, due := t.sightings.Observe(view); due {
+		return &sighting
+	}
+
+	return nil
 }
 
 // signalOnly is a change in signal strength, which is passed on if the device is wanted at all, and not more than every
@@ -157,8 +181,15 @@ func (t *Translator) Translate(o Observation) Result {
 func (t *Translator) signalOnly(o Observation, d *device) Result {
 	event := t.eventFor(o, d)
 
-	rule := bluetooth.MatchAny(t.coalescer.Rules(), t.viewOf(o, d))
-	if rule == nil || o.Time.Sub(d.lastRSSIOut) < RSSIEvery {
+	view := t.viewOf(o, d)
+
+	rule := bluetooth.MatchAny(t.coalescer.Rules(), view)
+	if rule == nil {
+		// Not wanted, but the signal of a device that is around is what a list of them shows.
+		return Result{Sighting: t.sighting(view)}
+	}
+
+	if o.Time.Sub(d.lastRSSIOut) < RSSIEvery {
 		return Result{}
 	}
 
