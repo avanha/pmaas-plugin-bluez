@@ -1,2 +1,40 @@
 # pmaas-plugin-bluez
-PMAAS plugin that integrates with bluez on Linux.
+
+A PMAAS plugin that hears Bluetooth LE advertisements with the local radio, through BlueZ over D-Bus, and says what it
+hears. It is a *source*: it knows nothing about what any device is. The
+[bluetooth plugin](../pmaas-plugin-bluetooth) takes advertisements from this and from any other source (an ESPHome
+Bluetooth proxy, in the esphome plugin), works out what the devices are, and publishes them. See that plugin's `DESIGN.md`.
+
+Linux only in practice, since BlueZ is. On another system the scan fails to start, the source reports itself offline, and
+nothing else happens, so one assembly can serve both.
+
+```go
+conf := bluez.NewPluginConfig()
+conf.Adapter = "hci0" // optional; the default is the system's default adapter
+coreConfig.AddPlugin(bluez.NewPlugin(conf), config.PluginConfig{})
+```
+
+## What it does
+
+* Runs a BlueZ discovery session for two minutes, pauses five seconds, and runs another, which is what flushes what BlueZ has
+  accumulated.
+* Turns what BlueZ reports (whole devices with properties, and changes to them) into `bluetooth.AdvertisementEvent`s
+  (`pmaas-spi/bluetooth`), carrying the device's name and services and only the data that is new. BlueZ keeps every
+  manufacturer data key it has seen in a session, and for some devices (the Inkbird) each reading is a key.
+* Forwards only what the bluetooth plugin has asked for (`bluetooth.InterestEvent`), applying the rules with the shared
+  `Coalescer`, so the many advertisements nobody wants are dropped here. **Until it has been told what is wanted it
+  forwards nothing.** A change in signal strength alone is passed on at most every 30 seconds.
+* Registers a source entity (`bluetooth.ISource`) with its connectivity and counters (heard, forwarded, dropped).
+
+## Layout
+
+* `internal/scanner`: the BlueZ part. A discovery session, and the properties of the devices it finds, as observations.
+* `internal/translate`: observations to advertisements. Plain Go, with the tests; no D-Bus.
+* `plugin.go`: the sessions, the interest, the source.
+
+## Notes
+
+* The BlueZ discovery filter is not used: BlueZ scans actively with its own interval and window, set in
+  `/etc/bluetooth/main.conf`.
+* BlueZ's D-Bus model reports a property only when it changes, so an advertisement identical to the last is invisible. That
+  matters for a button that repeats one frame; see the design's open questions.
