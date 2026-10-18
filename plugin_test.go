@@ -3,7 +3,11 @@ package bluez
 import (
 	"context"
 	"errors"
+	"html/template"
+	"io/fs"
+	"net/http"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"testing/synctest"
@@ -19,6 +23,10 @@ import (
 // fakeContainer is what the plugin uses of the container: registrations, the interest receiver, and the broadcasts.
 type fakeContainer struct {
 	spi.IPMAASContainer
+
+	routes      []string
+	listHandler http.HandlerFunc
+	listed      []any
 
 	mu           sync.Mutex
 	entities     []string
@@ -642,4 +650,134 @@ func TestScanning_ASightingThatCouldNotBeBroadcastIsCountedAsDropped(t *testing.
 
 		stop(p)
 	})
+}
+
+func (c *fakeContainer) ProvideContentFS(fs.FS, string) {}
+func (c *fakeContainer) EnableStaticContent(string)     {}
+func (c *fakeContainer) AddRoute(path string, handler http.HandlerFunc) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.routes = append(c.routes, path)
+	c.listHandler = handler
+}
+func (c *fakeContainer) RegisterEntityRenderer(reflect.Type, spi.EntityRendererFactory) {}
+func (c *fakeContainer) RenderList(_ http.ResponseWriter, _ *http.Request, _ spi.RenderListOptions, items []any) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.listed = items
+}
+
+func TestStatus_SaysWhatTheRadioIsDoingAndWhetherDataIsFlowing(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s := &sessions{scripts: []sessionScript{{err: errors.New("no adapter")}}}
+
+		p, _ := newTestPlugin(t, s)
+
+		// Before it starts it isn't anything yet.
+		if got := p.status(time.Now()); got.Connectivity != "" || got.Stale || got.Name != "Local Bluetooth" {
+			t.Fatalf("before: %+v", got)
+		}
+
+		p.Start()
+		synctest.Wait()
+
+		got := p.status(time.Now())
+		if got.Connectivity != "offline" || got.LastError != "unable to start scanning: no adapter" || got.Sessions != 0 || got.Stale || got.Adapter != "hci9" {
+			t.Fatalf("after a failure: %+v", got)
+		}
+
+		time.Sleep(6 * time.Second) // the next attempt works
+		synctest.Wait()
+
+		got = p.status(time.Now())
+		if got.Connectivity != "online" || got.Scanning != "active" || got.Sessions != 1 || got.Stale {
+			t.Fatalf("scanning: %+v", got)
+		}
+
+		// Scanning but hearing nothing is fine for a little while and then is not.
+		if later := p.status(time.Now().Add(staleAfter + time.Second)); !later.Stale {
+			t.Errorf("not stale after %v of silence: %+v", staleAfter, later)
+		}
+
+		// Hearing something starts the count again.
+		p.source.Heard(time.Now().Add(time.Minute))
+
+		if later := p.status(time.Now().Add(staleAfter + time.Second)); later.Stale || later.Heard != 1 {
+			t.Errorf("stale though it heard something a minute ago: %+v", later)
+		}
+
+		stop(p)
+	})
+}
+
+func TestStatusPage_IsTheListRouteAndShowsTheSource(t *testing.T) {
+	s := &sessions{}
+	p, c := newTestPlugin(t, s)
+
+	if len(c.routes) != 1 || c.routes[0] != "" {
+		t.Fatalf("routes %v", c.routes)
+	}
+
+	c.listHandler(nil, nil)
+
+	if len(c.listed) != 1 {
+		t.Fatalf("listed %v", c.listed)
+	}
+
+	if view, ok := c.listed[0].(*status); !ok || view.Name != "Local Bluetooth" {
+		t.Errorf("listed %#v", c.listed[0])
+	}
+
+	_ = p
+}
+
+func TestStatusTemplate_ShowsActivityAndWarnsOfSilenceAndFailures(t *testing.T) {
+	tmpl, err := template.New("").Funcs(statusTemplate.FuncMap).ParseFS(contentFS, "content/templates/bluez_status.htmlt")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	render := func(v status) string {
+		var out strings.Builder
+		if err := tmpl.Lookup("bluez_status.htmlt").Execute(&out, &v); err != nil {
+			t.Fatal(err)
+		}
+
+		return out.String()
+	}
+
+	now := time.Now()
+	healthy := render(status{Name: "Local Bluetooth", Adapter: "hci0", Connectivity: "online", Since: now.Add(-time.Hour), Scanning: "active",
+		LastHeard: now.Add(-3 * time.Second), Heard: 1000, Forwarded: 40, Sighted: 12, Sessions: 30})
+
+	for _, want := range []string{"Local Bluetooth", "hci0", "Scanning since", "3s ago", "1000", "40", "12", "30"} {
+		if !strings.Contains(healthy, want) {
+			t.Errorf("missing %q:\n%s", want, healthy)
+		}
+	}
+
+	for _, unwanted := range []string{"problem", "stale", "Dropped"} {
+		if strings.Contains(healthy, unwanted) {
+			t.Errorf("a healthy source shows %q:\n%s", unwanted, healthy)
+		}
+	}
+
+	bad := render(status{Name: "x", Connectivity: "online", Since: now.Add(-time.Hour), LastHeard: now.Add(-10 * time.Minute), Stale: true,
+		LastError: "BlueZ ended the discovery session", LastErrorTime: now.Add(-time.Minute), Dropped: 3})
+
+	for _, want := range []string{"stale", "Nothing has been heard", "BlueZ ended the discovery session", "Dropped"} {
+		if !strings.Contains(bad, want) {
+			t.Errorf("missing %q:\n%s", want, bad)
+		}
+	}
+
+	if offline := render(status{Name: "x", Connectivity: "offline", Since: now.Add(-time.Minute)}); !strings.Contains(offline, "Not scanning since") {
+		t.Errorf("offline:\n%s", offline)
+	}
+
+	if starting := render(status{Name: "x"}); !strings.Contains(starting, "Starting") {
+		t.Errorf("starting:\n%s", starting)
+	}
 }

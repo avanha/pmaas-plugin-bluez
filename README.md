@@ -38,3 +38,11 @@ coreConfig.AddPlugin(bluez.NewPlugin(conf), config.PluginConfig{})
   `/etc/bluetooth/main.conf`.
 * BlueZ's D-Bus model reports a property only when it changes, so an advertisement identical to the last is invisible. That
   matters for a button that repeats one frame; see the design's open questions.
+
+## Status page
+
+The plugin's page (`/plugins/bluez/`, "bluez" in the menu) shows the source: whether a discovery session is running and since
+when, the adapter, the scan mode, when anything was last heard, how many advertisements it has heard, how many it forwarded to
+the Bluetooth plugin, how many devices it told of in sightings, how many it dropped, and how many discovery sessions it has
+started. The last failure to start or keep a session, if any, is shown with its time. A radio that is scanning but has heard
+nothing for two minutes is flagged: a house is never that quiet, so the radio has probably stopped hearing.

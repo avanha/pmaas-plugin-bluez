@@ -37,6 +37,7 @@ type plugin struct {
 	container spi.IPMAASContainer
 	coalescer *bluetooth.Coalescer
 	source    *bluetooth.SourceState
+	diag      diagnostics
 
 	// startScan is how a session is started: BlueZ's, except in tests.
 	startScan startScanFunc
@@ -78,6 +79,11 @@ func (p *plugin) ShortName() string {
 func (p *plugin) Init(container spi.IPMAASContainer) {
 	p.container = container
 	p.log = logging.For(container)
+
+	container.ProvideContentFS(&contentFS, "content")
+	container.EnableStaticContent("static")
+	container.AddRoute("", p.handleStatus)
+	container.RegisterEntityRenderer(statusType, p.statusRendererFactory)
 }
 
 func (p *plugin) Start() {
@@ -121,6 +127,7 @@ func (p *plugin) Start() {
 		<-runDone
 	}
 
+	p.diag.setAdapter(adapterId)
 	p.log.Info("started, scanning", "adapter", adapterId)
 }
 
@@ -199,6 +206,7 @@ func (p *plugin) run(ctx context.Context, adapterId string, sourceId string) {
 		cancel()
 
 		if err != nil {
+			p.diag.failed(err, time.Now())
 			p.log.Error("the scan failed, trying again", "pause", p.config.pause, "error", err)
 		}
 
@@ -218,6 +226,7 @@ func (p *plugin) session(ctx context.Context, adapterId string, sourceId string)
 	}
 
 	p.sourceUp(time.Now())
+	p.diag.sessionStarted()
 
 	consumed := make(chan struct{})
 

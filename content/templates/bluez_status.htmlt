@@ -1,0 +1,26 @@
+<div class="entity-bluez-status{{if .Stale}} stale{{end}}">
+    <div class="header">
+        <span class="name">{{.Name | html}}</span>
+        <span class="adapter">{{.Adapter | html}}</span>
+        <span class="connection {{.Connectivity}}">
+            {{if eq .Connectivity "online"}}Scanning{{if .Since}} since {{RelativeTime .Since}}{{end}}
+            {{else if eq .Connectivity "offline"}}Not scanning{{if .Since}} since {{RelativeTime .Since}}{{end}}
+            {{else}}Starting{{end}}
+        </span>
+    </div>
+    {{if .Stale}}
+        <div class="problem"><i class="bi bi-exclamation-triangle-fill"></i> Nothing has been heard for {{RelativeTime .LastHeard}}: the radio may have stopped hearing.</div>
+    {{end}}
+    {{if .LastError}}
+        <div class="problem wrap"><i class="bi bi-exclamation-triangle-fill"></i> Last failure {{RelativeTime .LastErrorTime}}: {{.LastError | html}}</div>
+    {{end}}
+    <div class="details">
+        <span class="detail"><span class="label">Mode</span> {{.Scanning | html}}</span>
+        <span class="detail"><span class="label">Last heard</span> {{if .LastHeard.IsZero}}never{{else}}{{RelativeTime .LastHeard}}{{end}}</span>
+        <span class="detail"><span class="label">Heard</span> {{.Heard}}</span>
+        <span class="detail"><span class="label">Forwarded</span> {{.Forwarded}}</span>
+        <span class="detail"><span class="label">Sighted</span> {{.Sighted}}</span>
+        {{if .Dropped}}<span class="detail"><span class="label">Dropped</span> {{.Dropped}}</span>{{end}}
+        <span class="detail"><span class="label">Sessions</span> {{.Sessions}}</span>
+    </div>
+</div>

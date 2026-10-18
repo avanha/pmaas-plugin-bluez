@@ -1,0 +1,42 @@
+.entity-bluez-status .header {
+    display: flex;
+    flex-flow: row wrap;
+    align-items: baseline;
+}
+
+.entity-bluez-status .header .name {
+    font-size: 15pt;
+    margin-right: 10px;
+}
+
+.entity-bluez-status .header .adapter {
+    color: grey;
+    margin-right: 10px;
+}
+
+.entity-bluez-status .header .connection.offline {
+    color: #d0021b;
+}
+
+.entity-bluez-status .problem {
+    color: #d0021b;
+    margin: 5px 0;
+}
+
+.entity-bluez-status .details {
+    display: flex;
+    flex-flow: row wrap;
+    margin-top: 5px;
+}
+
+.entity-bluez-status .detail {
+    margin-right: 15px;
+}
+
+.entity-bluez-status .detail .label {
+    color: grey;
+}
+
+.entity-bluez-status .detail .label::after {
+    content: ":";
+}
