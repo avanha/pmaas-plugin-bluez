@@ -4,6 +4,7 @@ package scanner
 
 import (
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/avanha/pmaas-plugin-bluez/internal/translate"
@@ -16,6 +17,7 @@ import (
 
 // Scanner is one discovery session. It is used once: make another for the next.
 type Scanner struct {
+	log                *slog.Logger
 	devices            map[dbus.ObjectPath]*watched
 	watchConsumerCount int
 }
@@ -35,8 +37,10 @@ type propertyChange struct {
 	newValue   interface{}
 }
 
-func New() *Scanner {
-	return &Scanner{devices: make(map[dbus.ObjectPath]*watched)}
+func New(log *slog.Logger) *Scanner {
+	valueLog = log
+
+	return &Scanner{log: log, devices: make(map[dbus.ObjectPath]*watched)}
 }
 
 // StartScan starts discovery on the adapter. Observations arrive on the channel, which is closed when the session has ended; the
@@ -47,7 +51,7 @@ func (s *Scanner) StartScan(adapterId string) (chan translate.Observation, func(
 		return nil, nil, fmt.Errorf("error starting scan, unable to get adapter \"%s\": %w", adapterId, err)
 	}
 
-	fmt.Printf("Retrieved adapter interface %v\n", adapter1.Path())
+	s.log.Debug("retrieved adapter interface", "path", adapter1.Path())
 
 	var filter *adapter.DiscoveryFilter
 
@@ -65,9 +69,9 @@ func (s *Scanner) StartScan(adapterId string) (chan translate.Observation, func(
 		discoverCancelFunc()
 
 		if err := <-scanDone; err == nil {
-			fmt.Println("Discovery stopped")
+			s.log.Info("discovery stopped")
 		} else {
-			fmt.Printf("Discovery stopped with error: %s", err)
+			s.log.Error("discovery stopped with error", "error", err)
 		}
 
 		// Don't call api.Exit(): no more calls can be made to BlueZ afterwards.
@@ -80,7 +84,7 @@ func (s *Scanner) readDiscoveryEvents(
 	discoveryCh chan *adapter.DeviceDiscovered,
 	observationCh chan translate.Observation,
 	scanDoneCh chan error) {
-	fmt.Println("Start readDiscoveryEvents")
+	s.log.Debug("reading discovery events")
 
 	propChangeCh := make(chan *propertyChange, 100)
 	propChangeConsumerDoneCh := make(chan *watched)
@@ -90,7 +94,7 @@ LOOP:
 		select {
 		case discoveryEv := <-discoveryCh:
 			if discoveryEv == nil {
-				fmt.Println("Received nil discovery event")
+				s.log.Debug("received nil discovery event")
 				break LOOP
 			}
 
@@ -99,7 +103,7 @@ LOOP:
 			s.handlePropChangeEvent(propChangeEv, observationCh)
 		case dev := <-propChangeConsumerDoneCh:
 			s.watchConsumerCount--
-			fmt.Printf("PropChange consumer for %s is complete, %d active consumers\n", dev.path, s.watchConsumerCount)
+			s.log.Debug("propChange consumer is complete", "path", dev.path, "activeConsumers", s.watchConsumerCount)
 		}
 	}
 
@@ -122,7 +126,7 @@ LOOP:
 				s.handlePropChangeEvent(propChangeEv, observationCh)
 			case dev := <-propChangeConsumerDoneCh:
 				s.watchConsumerCount--
-				fmt.Printf("PropChange consumer for %s is complete, %d active consumers\n", dev.path, s.watchConsumerCount)
+				s.log.Debug("propChange consumer is complete", "path", dev.path, "activeConsumers", s.watchConsumerCount)
 
 				if s.watchConsumerCount == 0 {
 					break REMLOOP
@@ -141,7 +145,7 @@ LOOP:
 
 	close(observationCh)
 	close(scanDoneCh)
-	fmt.Println("End readDiscoveryEvents")
+	s.log.Debug("finished reading discovery events")
 }
 
 func (s *Scanner) handleDiscoveryEvent(
@@ -152,11 +156,11 @@ func (s *Scanner) handleDiscoveryEvent(
 	propChangeConsumerDoneCh chan *watched) {
 	switch ev.Type {
 	case adapter.DeviceRemoved:
-		fmt.Printf("Received DeviceRemoved event, path: %s\n", ev.Path)
+		s.log.Debug("received DeviceRemoved event", "path", ev.Path)
 
 		dev, ok := s.devices[ev.Path]
 		if !ok {
-			fmt.Printf("Device record not found, path: %s\n", ev.Path)
+			s.log.Debug("device record not found", "path", ev.Path)
 
 			return
 		}
@@ -173,7 +177,7 @@ func (s *Scanner) handleDiscoveryEvent(
 
 		d, err := device.NewDevice1(ev.Path)
 		if err != nil {
-			fmt.Printf("Failed to get device interface for path %s: %s\n", ev.Path, err)
+			s.log.Error("failed to get device interface", "path", ev.Path, "error", err)
 
 			return
 		}
@@ -194,7 +198,7 @@ func (s *Scanner) handleDiscoveryEvent(
 			ServiceData:      serviceDataOf(d.Properties.ServiceData),
 		}
 	default:
-		fmt.Printf("Received %s event, path: %s\n", deviceActionName(ev.Type), ev.Path)
+		s.log.Debug("received event", "action", deviceActionName(ev.Type), "path", ev.Path)
 	}
 }
 
@@ -214,7 +218,7 @@ func deviceActionName(action adapter.DeviceActions) string {
 func (s *Scanner) watchDevice(dev *watched, propChangeCh chan *propertyChange, propChangeConsumerDoneCh chan *watched) {
 	ch, err := dev.device.WatchProperties()
 	if err != nil {
-		fmt.Printf("Failed to watch properties of %s (%s): %s\n", dev.device.Properties.Name, dev.address, err)
+		s.log.Error("failed to watch properties", "name", dev.device.Properties.Name, "address", dev.address, "error", err)
 
 		return
 	}

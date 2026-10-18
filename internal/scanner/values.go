@@ -2,9 +2,13 @@ package scanner
 
 import (
 	"fmt"
+	"log/slog"
 
 	dbus "github.com/godbus/dbus/v5"
 )
+
+// valueLog is where the functions that read values out of BlueZ's properties log, which belong to no scanner. It is set by New.
+var valueLog = slog.New(slog.DiscardHandler)
 
 // manufacturerDataOf is BlueZ's manufacturer data, whose values are D-Bus variants, as bytes. A value that is not bytes is
 // left out.
@@ -39,7 +43,7 @@ func bytesOf(value interface{}) ([]byte, bool) {
 			return variantBytes, true
 		}
 
-		fmt.Printf("Unknown dbus.Variant type: %T\n", variant.Value())
+		valueLog.Debug("unknown dbus.Variant type", "type", fmt.Sprintf("%T", variant.Value()))
 
 		return nil, false
 	}

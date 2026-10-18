@@ -10,6 +10,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/avanha/pmaas-spi/logging"
+	"log/slog"
 	"time"
 
 	"github.com/avanha/pmaas-plugin-bluez/internal/scanner"
@@ -30,6 +32,7 @@ type Plugin interface {
 type startScanFunc func(adapterId string) (chan translate.Observation, func(), error)
 
 type plugin struct {
+	log       *slog.Logger
 	config    PluginConfig
 	container spi.IPMAASContainer
 	coalescer *bluetooth.Coalescer
@@ -55,15 +58,17 @@ var _ spi.IPMAASPlugin = (*plugin)(nil)
 func NewPlugin(config PluginConfig) Plugin {
 	config = config.withDefaults()
 
-	return &plugin{
-		config:    config,
-		coalescer: bluetooth.NewCoalescer(),
-		source:    bluetooth.NewSourceState(config.Name, "bluez"),
-		startScan: func(adapterId string) (chan translate.Observation, func(), error) {
-			return scanner.New().StartScan(adapterId)
-		},
+	p := &plugin{
+		config:         config,
+		coalescer:      bluetooth.NewCoalescer(),
+		source:         bluetooth.NewSourceState(config.Name, "bluez"),
 		defaultAdapter: api.GetDefaultAdapterID,
 	}
+	p.startScan = func(adapterId string) (chan translate.Observation, func(), error) {
+		return scanner.New(logging.For(p.container, "scanner")).StartScan(adapterId)
+	}
+
+	return p
 }
 
 func (p *plugin) ShortName() string {
@@ -72,15 +77,16 @@ func (p *plugin) ShortName() string {
 
 func (p *plugin) Init(container spi.IPMAASContainer) {
 	p.container = container
+	p.log = logging.For(container)
 }
 
 func (p *plugin) Start() {
-	fmt.Printf("%T Starting...\n", p)
+	p.log.Info("starting")
 
 	id, err := p.container.RegisterEntity(p.config.Name, bluetooth.ISourceType, p.config.Name,
 		func() (any, error) { return p.source, nil })
 	if err != nil {
-		fmt.Printf("%T unable to register the source: %v\n", p, err)
+		p.log.Error("unable to register the source", "error", err)
 	} else {
 		p.sourceEntityId = id
 	}
@@ -88,7 +94,7 @@ func (p *plugin) Start() {
 	handle, err := p.container.RegisterEventReceiver(bluetooth.InterestPredicate, p.onInterest)
 	if err != nil {
 		// Nothing would be forwarded, since nobody could say what they want.
-		fmt.Printf("%T unable to listen for what is wanted, so nothing will be forwarded: %v\n", p, err)
+		p.log.Error("unable to listen for what is wanted, so nothing will be forwarded", "error", err)
 	} else {
 		p.receiverHandle, p.receiverStarted = handle, true
 	}
@@ -115,7 +121,7 @@ func (p *plugin) Start() {
 		<-runDone
 	}
 
-	fmt.Printf("%T Started, scanning with %s\n", p, adapterId)
+	p.log.Info("started, scanning", "adapter", adapterId)
 }
 
 // onInterest is told what consumers want, on the plugin goroutine.
@@ -126,7 +132,7 @@ func (p *plugin) onInterest(eventInfo *events.EventInfo) error {
 	}
 
 	if err := p.coalescer.SetInterest(event); err != nil {
-		fmt.Printf("%T ignoring an interest from %q: %v\n", p, event.Owner, err)
+		p.log.Warn("ignoring an interest", "owner", event.Owner, "error", err)
 	}
 
 	return nil
@@ -136,13 +142,13 @@ func (p *plugin) onInterest(eventInfo *events.EventInfo) error {
 // session's own teardown. So the wait happens on a background goroutine, and the channel Stop returns is closed once it is
 // done, which is how the core is told the plugin has completely finished.
 func (p *plugin) Stop() chan func() {
-	fmt.Printf("%T Stopping...\n", p)
+	p.log.Info("stopping")
 
 	if p.receiverStarted {
 		p.receiverStarted = false
 
 		if err := p.container.DeregisterEventReceiver(p.receiverHandle); err != nil {
-			fmt.Printf("%T unable to stop listening for what is wanted: %v\n", p, err)
+			p.log.Error("unable to stop listening for what is wanted", "error", err)
 		}
 	}
 
@@ -168,7 +174,7 @@ func (p *plugin) Stop() chan func() {
 		// before the channel is closed: closing it is how the core knows this goroutine will touch nothing more.
 		stopRun()
 		p.deregisterSource(sourceEntityId)
-		fmt.Printf("%T Stopped\n", p)
+		p.log.Info("stopped")
 	}()
 
 	return done
@@ -180,7 +186,7 @@ func (p *plugin) deregisterSource(id string) {
 	}
 
 	if err := p.container.DeregisterEntity(id); err != nil {
-		fmt.Printf("%T unable to deregister the source: %v\n", p, err)
+		p.log.Error("unable to deregister the source", "error", err)
 	}
 }
 
@@ -193,7 +199,7 @@ func (p *plugin) run(ctx context.Context, adapterId string, sourceId string) {
 		cancel()
 
 		if err != nil {
-			fmt.Printf("%T the scan failed, trying again in %v: %s\n", p, p.config.pause, err)
+			p.log.Error("the scan failed, trying again", "pause", p.config.pause, "error", err)
 		}
 
 		if !wait(ctx, p.config.pause) {
@@ -267,7 +273,7 @@ func (p *plugin) handle(translator *translate.Translator, o translate.Observatio
 	if result.Sighting != nil {
 		if err := bluetooth.PublishSighting(p.container, *result.Sighting); err != nil {
 			p.source.Dropped()
-			fmt.Printf("%T unable to broadcast a sighting of %s: %v\n", p, result.Sighting.Address, err)
+			p.log.Error("unable to broadcast a sighting", "address", result.Sighting.Address, "error", err)
 
 			return
 		}
@@ -283,7 +289,7 @@ func (p *plugin) handle(translator *translate.Translator, o translate.Observatio
 
 	if err := bluetooth.PublishAdvertisement(p.container, result.Event); err != nil {
 		p.source.Dropped()
-		fmt.Printf("%T unable to broadcast an advertisement from %s: %v\n", p, result.Event.Address, err)
+		p.log.Error("unable to broadcast an advertisement", "address", result.Event.Address, "error", err)
 
 		return
 	}
