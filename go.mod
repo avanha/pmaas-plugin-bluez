@@ -3,7 +3,7 @@ module github.com/avanha/pmaas-plugin-bluez
 go 1.27.1
 
 require (
-	github.com/avanha/pmaas-spi v0.0.13
+	github.com/avanha/pmaas-spi v0.0.14
 	github.com/godbus/dbus/v5 v5.1.0
 	github.com/muka/go-bluetooth v0.0.0-20240701044517-04c4f09c514e
 )

@@ -1,5 +1,5 @@
-github.com/avanha/pmaas-spi v0.0.9 h1:mhAfS7WZ1+tI7AtGgSg3juVuaND0X4tS4YgoL1GHS9s=
-github.com/avanha/pmaas-spi v0.0.9/go.mod h1:vKV8Ke5QXei42A4agIgxypbznjLqFQyi2hvqSyoe7c0=
+github.com/avanha/pmaas-spi v0.0.14 h1:JIrxgl7Sc3etANISIyYPP86m/MstvG4YmnXf9PpfK28=
+github.com/avanha/pmaas-spi v0.0.14/go.mod h1:vKV8Ke5QXei42A4agIgxypbznjLqFQyi2hvqSyoe7c0=
 github.com/davecgh/go-spew v1.1.0/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
