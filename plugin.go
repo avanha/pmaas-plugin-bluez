@@ -20,7 +20,6 @@ import (
 	"github.com/avanha/pmaas-spi/bluetooth"
 	"github.com/avanha/pmaas-spi/environment"
 	"github.com/avanha/pmaas-spi/events"
-	"github.com/muka/go-bluetooth/api"
 )
 
 type Plugin interface {
@@ -63,7 +62,7 @@ func NewPlugin(config PluginConfig) Plugin {
 		config:         config,
 		coalescer:      bluetooth.NewCoalescer(),
 		source:         bluetooth.NewSourceState(config.Name, "bluez"),
-		defaultAdapter: api.GetDefaultAdapterID,
+		defaultAdapter: scanner.DefaultAdapterID,
 	}
 	p.startScan = func(adapterId string) (chan translate.Observation, func(), error) {
 		return scanner.New(logging.For(p.container, "scanner")).StartScan(adapterId)

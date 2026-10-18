@@ -52,3 +52,59 @@ func bytesOf(value interface{}) ([]byte, bool) {
 
 	return data, ok
 }
+
+// stringOf is a property that is a string, or empty if it is not one or is not there.
+func stringOf(v dbus.Variant) string {
+	s, _ := v.Value().(string)
+
+	return s
+}
+
+// rssiOf is the signal strength property, or 0 if it is not there.
+func rssiOf(v dbus.Variant) int {
+	switch n := v.Value().(type) {
+	case int16:
+		return int(n)
+	case int:
+		return n
+	default:
+		return 0
+	}
+}
+
+// uuidsOf is the service UUIDs property.
+func uuidsOf(v dbus.Variant) []string {
+	uuids, _ := v.Value().([]string)
+
+	return uuids
+}
+
+// manufacturerVariants is the manufacturer data property as manufacturerDataOf takes it.
+func manufacturerVariants(v dbus.Variant) map[uint16]interface{} {
+	data, ok := v.Value().(map[uint16]dbus.Variant)
+	if !ok {
+		return nil
+	}
+
+	out := make(map[uint16]interface{}, len(data))
+	for id, value := range data {
+		out[id] = value
+	}
+
+	return out
+}
+
+// serviceVariants is the service data property as serviceDataOf takes it.
+func serviceVariants(v dbus.Variant) map[string]interface{} {
+	data, ok := v.Value().(map[string]dbus.Variant)
+	if !ok {
+		return nil
+	}
+
+	out := make(map[string]interface{}, len(data))
+	for uuid, value := range data {
+		out[uuid] = value
+	}
+
+	return out
+}

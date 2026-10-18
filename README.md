@@ -28,14 +28,19 @@ coreConfig.AddPlugin(bluez.NewPlugin(conf), config.PluginConfig{})
 
 ## Layout
 
-* `internal/scanner`: the BlueZ part. A discovery session, and the properties of the devices it finds, as observations.
+* `internal/scanner`: the BlueZ part. A discovery session, and the properties of the devices it finds, as observations. It talks to
+  BlueZ over D-Bus with [godbus](https://github.com/godbus/dbus) directly (no Bluetooth library: the unmaintained ones were more to keep
+  up with than the handful of calls and three kinds of signal a session needs). The connection is behind an interface so the
+  session logic is tested with signals made up in the test; the real D-Bus part is small.
 * `internal/translate`: observations to advertisements. Plain Go, with the tests; no D-Bus.
 * `plugin.go`: the sessions, the interest, the source.
 
 ## Notes
 
-* The BlueZ discovery filter is not used: BlueZ scans actively with its own interval and window, set in
-  `/etc/bluetooth/main.conf`.
+* The discovery filter asks for low energy devices only, and for every advertisement (`DuplicateData`). BlueZ scans actively with its
+  own interval and window, set in `/etc/bluetooth/main.conf`. The adapter is powered on if it is off.
+* A session ends when it is stopped, when BlueZ stops discovering (the adapter's `Discovering` goes false), when bluetoothd leaves
+  the bus, or when the connection drops; the plugin starts another after its pause.
 * BlueZ's D-Bus model reports a property only when it changes, so an advertisement identical to the last is invisible. That
   matters for a button that repeats one frame; see the design's open questions.
 

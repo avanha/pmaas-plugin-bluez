@@ -1,284 +1,356 @@
-// Package scanner is the part that is BlueZ: it runs a discovery session on an adapter, watches the properties of the devices
-// BlueZ finds, and reports what it sees as observations (see the translate package). It decides nothing.
+// Package scanner is the part that is BlueZ: it runs a discovery session on an adapter, watches the devices BlueZ finds, and
+// reports what it sees as observations (see the translate package). It decides nothing.
+//
+// It talks to BlueZ over D-Bus, directly, with godbus: a discovery session is a few calls on the adapter and three kinds of
+// signal, so a Bluetooth library on top of that would be more to keep up with than the thing it saves.
 package scanner
 
 import (
 	"fmt"
 	"log/slog"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/avanha/pmaas-plugin-bluez/internal/translate"
 	dbus "github.com/godbus/dbus/v5"
-	"github.com/muka/go-bluetooth/api"
-	"github.com/muka/go-bluetooth/bluez"
-	"github.com/muka/go-bluetooth/bluez/profile/adapter"
-	"github.com/muka/go-bluetooth/bluez/profile/device"
 )
+
+const (
+	bluezName       = "org.bluez"
+	adapterPrefix   = "/org/bluez/"
+	adapterIface    = "org.bluez.Adapter1"
+	deviceIface     = "org.bluez.Device1"
+	propertiesIface = "org.freedesktop.DBus.Properties"
+
+	signalPropertiesChanged = propertiesIface + ".PropertiesChanged"
+	signalInterfacesAdded   = "org.freedesktop.DBus.ObjectManager.InterfacesAdded"
+	signalInterfacesRemoved = "org.freedesktop.DBus.ObjectManager.InterfacesRemoved"
+	signalNameOwnerChanged  = "org.freedesktop.DBus.NameOwnerChanged"
+)
+
+// fallbackAdapter is the adapter used when BlueZ can't be asked which there are: the first one, as the kernel names them.
+const fallbackAdapter = "hci0"
+
+// bus is what a session needs of the connection to BlueZ, which is D-Bus, and which a test can stand in for.
+type bus interface {
+	// StartDiscovery has the adapter scan for low energy devices, powering it on if it is off.
+	StartDiscovery(adapter dbus.ObjectPath) error
+
+	// StopDiscovery has it stop.
+	StopDiscovery(adapter dbus.ObjectPath) error
+
+	// Signals are the signals a session reads, already asked for: changes to the properties of what is under the adapter, objects
+	// appearing and disappearing, and bluetoothd leaving the bus. The channel is closed when the connection ends.
+	Signals() <-chan *dbus.Signal
+
+	// DeviceProperties is everything BlueZ holds about a device.
+	DeviceProperties(device dbus.ObjectPath) (map[string]dbus.Variant, error)
+
+	Close() error
+}
+
+// connectFunc makes the connection to BlueZ for a session on the adapter.
+type connectFunc func(adapter dbus.ObjectPath) (bus, error)
 
 // Scanner is one discovery session. It is used once: make another for the next.
 type Scanner struct {
-	log                *slog.Logger
-	devices            map[dbus.ObjectPath]*watched
-	watchConsumerCount int
-}
-
-// watched is a device BlueZ has found, and the channel its property changes come on.
-type watched struct {
-	path             dbus.ObjectPath
-	address          string
-	device           *device.Device1
-	propertyChangeCh chan *bluez.PropertyChanged
-}
-
-type propertyChange struct {
-	bluezEvent *bluez.PropertyChanged
-	device     *watched
-	eventTime  time.Time
-	newValue   interface{}
+	log     *slog.Logger
+	connect connectFunc
+	now     func() time.Time
 }
 
 func New(log *slog.Logger) *Scanner {
 	valueLog = log
 
-	return &Scanner{log: log, devices: make(map[dbus.ObjectPath]*watched)}
+	return &Scanner{log: log, connect: connectSystemBus, now: time.Now}
 }
 
-// StartScan starts discovery on the adapter. Observations arrive on the channel, which is closed when the session has ended; the
-// function stops the session and waits for that.
+// StartScan starts discovery on the adapter, which is named as the kernel does, "hci0". Observations arrive on the channel, which is
+// closed when the session has ended, whether it was stopped or BlueZ ended it; the function stops the session and waits for that.
 func (s *Scanner) StartScan(adapterId string) (chan translate.Observation, func(), error) {
-	adapter1, err := api.GetAdapter(adapterId)
+	adapter := dbus.ObjectPath(adapterPrefix + adapterId)
+
+	b, err := s.connect(adapter)
 	if err != nil {
-		return nil, nil, fmt.Errorf("error starting scan, unable to get adapter \"%s\": %w", adapterId, err)
+		return nil, nil, fmt.Errorf("unable to connect to BlueZ for adapter \"%s\": %w", adapterId, err)
 	}
 
-	s.log.Debug("retrieved adapter interface", "path", adapter1.Path())
+	if err := b.StartDiscovery(adapter); err != nil {
+		_ = b.Close()
 
-	var filter *adapter.DiscoveryFilter
-
-	discoveryCh, discoverCancelFunc, err := api.Discover(adapter1, filter)
-	if err != nil {
-		return nil, nil, fmt.Errorf("error starting scan, unable to start discovery: %w", err)
+		return nil, nil, fmt.Errorf("unable to start discovery on adapter \"%s\": %w", adapterId, err)
 	}
 
 	observationCh := make(chan translate.Observation, 10)
-	scanDone := make(chan error)
+	stop := make(chan struct{})
+	done := make(chan struct{})
 
-	go s.readDiscoveryEvents(discoveryCh, observationCh, scanDone)
-
-	cancelFunc := func() {
-		discoverCancelFunc()
-
-		if err := <-scanDone; err == nil {
-			s.log.Info("discovery stopped")
-		} else {
-			s.log.Error("discovery stopped with error", "error", err)
-		}
-
-		// Don't call api.Exit(): no more calls can be made to BlueZ afterwards.
-	}
-
-	return observationCh, cancelFunc, nil
-}
-
-func (s *Scanner) readDiscoveryEvents(
-	discoveryCh chan *adapter.DeviceDiscovered,
-	observationCh chan translate.Observation,
-	scanDoneCh chan error) {
-	s.log.Debug("reading discovery events")
-
-	propChangeCh := make(chan *propertyChange, 100)
-	propChangeConsumerDoneCh := make(chan *watched)
-
-LOOP:
-	for {
-		select {
-		case discoveryEv := <-discoveryCh:
-			if discoveryEv == nil {
-				s.log.Debug("received nil discovery event")
-				break LOOP
-			}
-
-			s.handleDiscoveryEvent(discoveryEv, time.Now(), propChangeCh, observationCh, propChangeConsumerDoneCh)
-		case propChangeEv := <-propChangeCh:
-			s.handlePropChangeEvent(propChangeEv, observationCh)
-		case dev := <-propChangeConsumerDoneCh:
-			s.watchConsumerCount--
-			s.log.Debug("propChange consumer is complete", "path", dev.path, "activeConsumers", s.watchConsumerCount)
-		}
-	}
-
-	// At this point, there will be no more discovery events: unwatch any currently present devices.
-	for path, dev := range s.devices {
-		dev.device.UnwatchProperties(dev.propertyChangeCh)
-		delete(s.devices, path)
-	}
-
-	if s.watchConsumerCount == 0 {
-		// There are no active property watch consumers, so close the channels now.
-		close(propChangeCh)
-		close(propChangeConsumerDoneCh)
-	} else {
-		// Keep consuming property change events until all the consumers have stopped.
-	REMLOOP:
-		for {
-			select {
-			case propChangeEv := <-propChangeCh:
-				s.handlePropChangeEvent(propChangeEv, observationCh)
-			case dev := <-propChangeConsumerDoneCh:
-				s.watchConsumerCount--
-				s.log.Debug("propChange consumer is complete", "path", dev.path, "activeConsumers", s.watchConsumerCount)
-
-				if s.watchConsumerCount == 0 {
-					break REMLOOP
-				}
-			}
-		}
-
-		close(propChangeCh)
-		close(propChangeConsumerDoneCh)
-
-		// Consume what was left in the property change channel's buffer.
-		for propChangeEv := range propChangeCh {
-			s.handlePropChangeEvent(propChangeEv, observationCh)
-		}
-	}
-
-	close(observationCh)
-	close(scanDoneCh)
-	s.log.Debug("finished reading discovery events")
-}
-
-func (s *Scanner) handleDiscoveryEvent(
-	ev *adapter.DeviceDiscovered,
-	eventTime time.Time,
-	propChangeCh chan *propertyChange,
-	observationCh chan translate.Observation,
-	propChangeConsumerDoneCh chan *watched) {
-	switch ev.Type {
-	case adapter.DeviceRemoved:
-		s.log.Debug("received DeviceRemoved event", "path", ev.Path)
-
-		dev, ok := s.devices[ev.Path]
-		if !ok {
-			s.log.Debug("device record not found", "path", ev.Path)
-
-			return
-		}
-
-		dev.device.UnwatchProperties(dev.propertyChangeCh)
-		delete(s.devices, ev.Path)
-		observationCh <- translate.Observation{Kind: translate.Removed, Time: eventTime, Address: dev.address}
-	case adapter.DeviceAdded:
-		existing, ok := s.devices[ev.Path]
-		if ok {
-			existing.device.UnwatchProperties(existing.propertyChangeCh)
-			delete(s.devices, ev.Path)
-		}
-
-		d, err := device.NewDevice1(ev.Path)
-		if err != nil {
-			s.log.Error("failed to get device interface", "path", ev.Path, "error", err)
-
-			return
-		}
-
-		dev := &watched{path: ev.Path, address: d.Properties.Address, device: d}
-		s.devices[ev.Path] = dev
-		s.watchDevice(dev, propChangeCh, propChangeConsumerDoneCh)
-
-		observationCh <- translate.Observation{
-			Kind:             translate.Added,
-			Time:             eventTime,
-			Address:          d.Properties.Address,
-			AddressType:      d.Properties.AddressType,
-			Name:             d.Properties.Name,
-			RSSI:             int(d.Properties.RSSI),
-			UUIDs:            d.Properties.UUIDs,
-			ManufacturerData: manufacturerDataOf(d.Properties.ManufacturerData),
-			ServiceData:      serviceDataOf(d.Properties.ServiceData),
-		}
-	default:
-		s.log.Debug("received event", "action", deviceActionName(ev.Type), "path", ev.Path)
-	}
-}
-
-// deviceActionName names a device discovery action for logging. go-bluetooth's DeviceActions is a bare
-// uint8 with no String method, so formatting it directly prints something like "%!s(adapter.DeviceActions=0)".
-func deviceActionName(action adapter.DeviceActions) string {
-	switch action {
-	case adapter.DeviceAdded:
-		return "device added"
-	case adapter.DeviceRemoved:
-		return "device removed"
-	default:
-		return fmt.Sprintf("unknown device action (%d)", uint8(action))
-	}
-}
-
-func (s *Scanner) watchDevice(dev *watched, propChangeCh chan *propertyChange, propChangeConsumerDoneCh chan *watched) {
-	ch, err := dev.device.WatchProperties()
-	if err != nil {
-		s.log.Error("failed to watch properties", "name", dev.device.Properties.Name, "address", dev.address, "error", err)
-
-		return
-	}
-
-	// Saved so that UnwatchProperties can be called when the device is removed, or when it is time to shut down.
-	dev.propertyChangeCh = ch
-	s.watchConsumerCount++
+	sess := &session{log: s.log, bus: b, adapter: adapter, now: s.now, out: observationCh, stop: stop, devices: make(map[dbus.ObjectPath]*known)}
 
 	go func() {
-		for evt := range ch {
-			if evt == nil {
-				break
-			}
+		defer close(done)
+		defer close(observationCh)
 
-			// Capture the new value now, in this goroutine, before sending it on to the one that consumes the channel.
-			var newValue interface{}
-
-			switch evt.Name {
-			case "ManufacturerData":
-				newValue = dev.device.Properties.ManufacturerData
-			case "RSSI":
-				newValue = dev.device.Properties.RSSI
-			case "UUIDs":
-				newValue = dev.device.Properties.UUIDs
-			case "ServiceData":
-				newValue = dev.device.Properties.ServiceData
-			case "Name":
-				newValue = dev.device.Properties.Name
-			}
-
-			propChangeCh <- &propertyChange{bluezEvent: evt, device: dev, eventTime: time.Now(), newValue: newValue}
-		}
-
-		propChangeConsumerDoneCh <- dev
+		sess.run()
 	}()
-}
 
-func (s *Scanner) handlePropChangeEvent(evt *propertyChange, observationCh chan translate.Observation) {
-	o := translate.Observation{
-		Time:        evt.eventTime,
-		Address:     evt.device.address,
-		AddressType: evt.device.device.Properties.AddressType,
+	var once sync.Once
+
+	cancel := func() {
+		once.Do(func() {
+			close(stop)
+
+			if err := b.StopDiscovery(adapter); err != nil {
+				s.log.Warn("unable to stop discovery", "error", err)
+			}
+
+			// Closing the connection ends the signals, which is what a session waiting on them is woken by.
+			if err := b.Close(); err != nil {
+				s.log.Warn("error closing the connection to BlueZ", "error", err)
+			}
+		})
+
+		<-done
+		s.log.Info("discovery stopped")
 	}
 
-	switch evt.bluezEvent.Name {
-	case "ManufacturerData":
-		data, _ := evt.newValue.(map[uint16]interface{})
-		o.Kind, o.ManufacturerData = translate.ManufacturerData, manufacturerDataOf(data)
-	case "ServiceData":
-		data, _ := evt.newValue.(map[string]interface{})
-		o.Kind, o.ServiceData = translate.ServiceData, serviceDataOf(data)
-	case "UUIDs":
-		o.Kind, o.UUIDs = translate.UUIDs, evt.newValue.([]string)
-	case "Name":
-		o.Kind, o.Name = translate.Name, evt.newValue.(string)
-	case "RSSI":
-		o.Kind, o.RSSI = translate.RSSI, int(evt.newValue.(int16))
-	default:
+	return observationCh, cancel, nil
+}
+
+// known is a device the session has met: what doesn't change about it, which each observation of it carries.
+type known struct {
+	address     string
+	addressType string
+}
+
+// session reads the signals of one discovery session and turns them into observations.
+type session struct {
+	log     *slog.Logger
+	bus     bus
+	adapter dbus.ObjectPath
+	now     func() time.Time
+	out     chan translate.Observation
+	stop    chan struct{}
+	devices map[dbus.ObjectPath]*known
+}
+
+// run reads signals until the session is stopped, the connection ends, or BlueZ ends the discovery.
+func (s *session) run() {
+	s.log.Debug("reading discovery events")
+	defer s.log.Debug("finished reading discovery events")
+
+	signals := s.bus.Signals()
+
+	for {
+		select {
+		case <-s.stop:
+			return
+		case signal, ok := <-signals:
+			if !ok {
+				return
+			}
+
+			if signal == nil {
+				continue
+			}
+
+			if ended := s.handle(signal); ended {
+				return
+			}
+		}
+	}
+}
+
+// emit hands an observation on, unless the session is being stopped: nobody is reading then.
+func (s *session) emit(o translate.Observation) {
+	select {
+	case s.out <- o:
+	case <-s.stop:
+	}
+}
+
+func (s *session) underAdapter(path dbus.ObjectPath) bool {
+	return strings.HasPrefix(string(path), string(s.adapter)+"/")
+}
+
+// handle deals with one signal, and reports whether it ended the session.
+func (s *session) handle(signal *dbus.Signal) bool {
+	switch signal.Name {
+	case signalInterfacesAdded:
+		s.interfacesAdded(signal)
+	case signalInterfacesRemoved:
+		s.interfacesRemoved(signal)
+	case signalPropertiesChanged:
+		return s.propertiesChanged(signal)
+	case signalNameOwnerChanged:
+		return s.nameOwnerChanged(signal)
+	}
+
+	return false
+}
+
+func (s *session) interfacesAdded(signal *dbus.Signal) {
+	if len(signal.Body) < 2 {
 		return
 	}
 
-	observationCh <- o
+	path, ok1 := signal.Body[0].(dbus.ObjectPath)
+	interfaces, ok2 := signal.Body[1].(map[string]map[string]dbus.Variant)
+
+	if !ok1 || !ok2 || !s.underAdapter(path) {
+		return
+	}
+
+	properties, ok := interfaces[deviceIface]
+	if !ok {
+		return
+	}
+
+	s.log.Debug("received a device added", "path", path)
+
+	device := &known{address: stringOf(properties["Address"]), addressType: stringOf(properties["AddressType"])}
+	s.devices[path] = device
+
+	s.emit(translate.Observation{
+		Kind:             translate.Added,
+		Time:             s.now(),
+		Address:          device.address,
+		AddressType:      device.addressType,
+		Name:             stringOf(properties["Name"]),
+		RSSI:             rssiOf(properties["RSSI"]),
+		UUIDs:            uuidsOf(properties["UUIDs"]),
+		ManufacturerData: manufacturerDataOf(manufacturerVariants(properties["ManufacturerData"])),
+		ServiceData:      serviceDataOf(serviceVariants(properties["ServiceData"])),
+	})
+}
+
+func (s *session) interfacesRemoved(signal *dbus.Signal) {
+	if len(signal.Body) < 2 {
+		return
+	}
+
+	path, ok1 := signal.Body[0].(dbus.ObjectPath)
+	removed, ok2 := signal.Body[1].([]string)
+
+	if !ok1 || !ok2 || !s.underAdapter(path) {
+		return
+	}
+
+	for _, iface := range removed {
+		if iface != deviceIface {
+			continue
+		}
+
+		s.log.Debug("received a device removed", "path", path)
+
+		device, ok := s.devices[path]
+		if !ok {
+			s.log.Debug("device record not found", "path", path)
+
+			return
+		}
+
+		delete(s.devices, path)
+		s.emit(translate.Observation{Kind: translate.Removed, Time: s.now(), Address: device.address})
+
+		return
+	}
+}
+
+// propertiesChanged reports whether the change ended the session: the adapter's discovery has stopped.
+func (s *session) propertiesChanged(signal *dbus.Signal) bool {
+	if len(signal.Body) < 2 {
+		return false
+	}
+
+	iface, ok1 := signal.Body[0].(string)
+	changed, ok2 := signal.Body[1].(map[string]dbus.Variant)
+
+	if !ok1 || !ok2 {
+		return false
+	}
+
+	switch {
+	case iface == adapterIface && signal.Path == s.adapter:
+		if discovering, ok := changed["Discovering"]; ok {
+			if on, isBool := discovering.Value().(bool); isBool && !on {
+				s.log.Warn("BlueZ stopped discovering", "adapter", s.adapter)
+
+				return true
+			}
+		}
+	case iface == deviceIface && s.underAdapter(signal.Path):
+		s.deviceChanged(signal.Path, changed)
+	}
+
+	return false
+}
+
+func (s *session) deviceChanged(path dbus.ObjectPath, changed map[string]dbus.Variant) {
+	device, ok := s.devices[path]
+	if !ok {
+		// A device BlueZ already had when the session began: it is told of by its changes, and what doesn't change is asked for.
+		properties, err := s.bus.DeviceProperties(path)
+		if err != nil {
+			s.log.Error("failed to get device properties", "path", path, "error", err)
+
+			return
+		}
+
+		device = &known{address: stringOf(properties["Address"]), addressType: stringOf(properties["AddressType"])}
+		s.devices[path] = device
+	}
+
+	base := translate.Observation{Time: s.now(), Address: device.address, AddressType: device.addressType}
+
+	// The name and the services before the reading, and the signal last: a reading that arrives with them is then
+	// attributed to a device that is known.
+	if v, ok := changed["Name"]; ok {
+		o := base
+		o.Kind, o.Name = translate.Name, stringOf(v)
+		s.emit(o)
+	}
+
+	if v, ok := changed["UUIDs"]; ok {
+		o := base
+		o.Kind, o.UUIDs = translate.UUIDs, uuidsOf(v)
+		s.emit(o)
+	}
+
+	if v, ok := changed["ServiceData"]; ok {
+		o := base
+		o.Kind, o.ServiceData = translate.ServiceData, serviceDataOf(serviceVariants(v))
+		s.emit(o)
+	}
+
+	if v, ok := changed["ManufacturerData"]; ok {
+		o := base
+		o.Kind, o.ManufacturerData = translate.ManufacturerData, manufacturerDataOf(manufacturerVariants(v))
+		s.emit(o)
+	}
+
+	if v, ok := changed["RSSI"]; ok {
+		o := base
+		o.Kind, o.RSSI = translate.RSSI, rssiOf(v)
+		s.emit(o)
+	}
+}
+
+// nameOwnerChanged reports whether bluetoothd left the bus, which is the end of every session.
+func (s *session) nameOwnerChanged(signal *dbus.Signal) bool {
+	if len(signal.Body) < 3 {
+		return false
+	}
+
+	name, ok1 := signal.Body[0].(string)
+	newOwner, ok2 := signal.Body[2].(string)
+
+	if ok1 && ok2 && name == bluezName && newOwner == "" {
+		s.log.Warn("BlueZ left the bus")
+
+		return true
+	}
+
+	return false
 }
