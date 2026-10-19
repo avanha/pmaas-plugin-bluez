@@ -4,6 +4,7 @@ import (
 	"embed"
 	"errors"
 	"fmt"
+	"github.com/avanha/pmaas-spi/format"
 	"io"
 	"net/http"
 	"reflect"
@@ -24,7 +25,7 @@ const staleAfter = 2 * time.Minute
 
 var statusTemplate = spi.TemplateInfo{
 	Name:    "bluez_status",
-	FuncMap: template.FuncMap{"RelativeTime": relativeTime},
+	FuncMap: template.FuncMap{"RelativeTime": format.AgoSeconds},
 	Paths:   []string{"templates/bluez_status.htmlt"},
 	Styles:  []string{"css/bluez_status.css"},
 }
@@ -151,27 +152,4 @@ func (p *plugin) statusRendererFactory() (spi.EntityRenderer, error) {
 	}
 
 	return spi.EntityRenderer{StreamingRenderFunc: renderer, Styles: compiled.Styles, Scripts: compiled.Scripts}, nil
-}
-
-// relativeTime says how long ago a time was, down to the second for the first minute: whether data is flowing is a matter of
-// seconds.
-func relativeTime(t time.Time) string {
-	if t.IsZero() {
-		return "never"
-	}
-
-	elapsed := time.Since(t).Truncate(time.Second)
-
-	switch {
-	case elapsed < 0:
-		return "just now"
-	case elapsed < time.Minute:
-		return fmt.Sprintf("%ds ago", int(elapsed.Seconds()))
-	case elapsed < time.Hour:
-		return fmt.Sprintf("%dm ago", int(elapsed.Minutes()))
-	case elapsed < 24*time.Hour:
-		return fmt.Sprintf("%dh %dm ago", int(elapsed.Hours()), int(elapsed.Minutes())%60)
-	default:
-		return fmt.Sprintf("%dd %dh ago", int(elapsed.Hours())/24, int(elapsed.Hours())%24)
-	}
 }
