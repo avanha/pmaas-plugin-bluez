@@ -1,4 +1,4 @@
-github.com/avanha/pmaas-spi v0.0.15 h1:nQ1ZTR0GvTdVSztyy+0sHuDEJKYJwRq+rHYtNvwDHRk=
-github.com/avanha/pmaas-spi v0.0.15/go.mod h1:vKV8Ke5QXei42A4agIgxypbznjLqFQyi2hvqSyoe7c0=
+github.com/avanha/pmaas-spi v0.0.20 h1:+1DXuFL3dNRGBHrtftZobgDCp84gn700UyhrAhctDyQ=
+github.com/avanha/pmaas-spi v0.0.20/go.mod h1:vKV8Ke5QXei42A4agIgxypbznjLqFQyi2hvqSyoe7c0=
 github.com/godbus/dbus/v5 v5.1.0 h1:4KLkAxT3aOY8Li4FRJe/KvhoNFFxo0m6fNuFUO8QJUk=
 github.com/godbus/dbus/v5 v5.1.0/go.mod h1:xhWf0FNVPg57R7Z0UbKHbJfkEywrmjJnf7w5xrFpKfA=
